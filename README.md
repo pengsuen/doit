@@ -1,266 +1,404 @@
-# 国家油气管网智能生产运营辅助系统后端 V1.3
-
-V1.3 是 Python 3.14 模块化单体后端。代码按业务功能垂直组织，并把文字模型、语音识别、视觉模型和对象存储拆成四套稳定端口。当前默认使用：
-
-- 文字：阿里云百炼千问 `qwen3.7-plus`（远程 API）。
-- 语音：本地 faster-whisper `large-v3`。
-- 视觉：本地 MiniCPM-V 4.6。
-- 文件：本地私有文件系统；以后可直接切换 AWS S3。
-
-不使用 RAG、向量数据库或 Elasticsearch，也不连接或控制 SCADA。
-
-## 1. 代码结构
-
-```text
-app/
-├── modules/
-│   ├── handover/              # 交接班录音、转写、校订和交接重点
-│   ├── operation_event/       # 生产运行事件抽取、版本和确认
-│   ├── maintenance_order/     # 异常分级、人工审核和工单状态机
-│   ├── inspection/            # 人工上传巡检图片、隐患候选和人工复核
-│   └── report/                # 日报/复盘、审核、发布和 DOCX 导出
-│       ├── api/
-│       ├── application/
-│       ├── domain/
-│       └── infrastructure/
-├── ports/                     # 业务层唯一允许依赖的外部能力接口
-│   ├── text.py
-│   ├── speech.py
-│   ├── vision.py
-│   └── storage.py
-├── infrastructure/
-│   ├── providers/             # 千问、OpenAI、本地/自训 HTTP、Fake 适配器
-│   └── storage/               # 本地文件、AWS/S3、内存测试适配器
-├── shared/
-│   ├── security/
-│   │   ├── identity/         # 数据库用户和组织身份
-│   │   ├── authentication/   # JWT 验签并解析数据库身份（AuthN）
-│   │   ├── authorization/    # 角色、权限和数据范围决策（AuthZ）
-│   │   └── audit/            # 安全审计上下文
-│   └── ...                   # Outbox、任务和传输入口
-└── bootstrap/                 # 配置及 Provider 装配
-
-inference/
-├── asr_service/               # 独立 faster-whisper 服务
-└── vision_service/            # 独立 MiniCPM-V 服务
-
-dev/mock_idp/                  # 仅供开发/测试使用的独立外部 JWT 签发服务
-```
-
-`tests/test_architecture.py` 会阻止业务模块绕过 `ports` 直接导入外部实现，也会阻止项目重新退化为一个大而全的 `AIProvider`。
-
-## 2. 兼容基线
-
-- 主后端：CPython `>=3.14,<3.15`；容器固定 `3.14.7-slim-trixie`。
-- PostgreSQL `18.6`。
-- FastAPI `0.141.1`、Pydantic `2.13.4`、SQLAlchemy `2.0.52`。
-- Celery `5.6.3`、RabbitMQ `4.3.5`、Redis `8.10.1`。
-- LangGraph `1.2.11`。
-- 本地 ASR/视觉运行时单独使用 Python 3.13 容器，避免 PyTorch、CTranslate2、CUDA 等原生依赖影响 Python 3.14 主后端。
-
-主后端所有直接和传递依赖固定在 `pyproject.toml` 与 `uv.lock`。本地推理服务各自拥有独立依赖文件。
-
-## 3. PyCharm 本机启动
-
-### 3.1 准备配置
-
-```bash
-cp .env.example .env
-```
-
-在 `.env` 中只需先填写：
-
-```env
-DASHSCOPE_API_KEY=你的百炼API密钥
-```
-
-默认的 `QWEN_BASE_URL` 使用百炼公共 OpenAI 兼容地址，不要求额外填写 Workspace ID。
-
-### 3.2 启动基础设施
-
-本地开发使用 `shared-infra.compose.yml` 管理的共享 PostgreSQL、RabbitMQ、Redis 和 SeaweedFS：
-
-```bash
-docker compose -f shared-infra.compose.yml up -d postgres rabbitmq redis
-docker compose -f shared-infra.compose.yml ps
-```
-
-PipeChina 的 API、Worker、Beat、迁移和 Mock IdP 只从 PyCharm 或宿主机启动，所有连接参数由 `.env` 提供，通过映射端口访问 `127.0.0.1`。
-
-Mock IdP 作为项目开发进程单独启动：
-
-```bash
-uv run uvicorn dev.mock_idp.main:app --host 127.0.0.1 --port 9001 --reload
-```
-
-### 3.3 创建 Python 3.14 环境
-
-```bash
-uv python install 3.14
-uv sync --frozen --group dev
-uv run alembic upgrade head
-uv run python scripts/bootstrap_mock_idp_users.py
-```
-
-Alembic、初始化脚本、API 和 Celery 均自动读取 `.env`，无需在命令行重复填写 URL。
-
-PyCharm Interpreter 选择项目内 `.venv`。API 运行配置：
-
-```bash
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-```
-
-Celery Worker 运行配置：
-
-```bash
-uv run celery -A app.bootstrap.celery_app:celery_app worker -l INFO -Q audio,ai_text,vision,report,maintenance
-```
-
-Celery Beat 运行配置：
-
-```bash
-uv run celery -A app.bootstrap.celery_app:celery_app beat -l INFO
-```
-
-### 3.4 启动本地语音和视觉模型
-
-```bash
-docker compose --profile local-models up -d --build asr vision
-```
-
-首次启动会下载 `large-v3` 和 MiniCPM-V 4.6 权重。因此，“只填千问 Key”足以启动文字能力，但要实际处理音频和图片，还必须启动这两个本地推理服务并具备相应磁盘、内存或 GPU 资源。
-
-接口文档：`http://localhost:8000/docs`。
-
-主后端不签发 JWT，也不保存 JWT 私钥或共享密钥。开发环境的 JWT 由独立的
-`mock-idp` 进程使用 RS256 私钥签发，主后端只通过 JWKS 公钥验证。获取开发令牌：
-
-```bash
-curl -X POST http://127.0.0.1:9001/token \
-  -H 'Content-Type: application/x-www-form-urlencoded' \
-  -d 'grant_type=password&username=admin&password=123456'
-```
-
-开发账号如下：
-
-| 用户名 | 密码 | 应用状态 | 数据库权限 |
-|---|---|---|---|
-| `admin` | `123456` | 启用 | 全局系统管理员 |
-| `peter` | `123456` | 启用 | 本组织生产调度员 |
-| `tom` | `123456` | 停用 | 无；即使外部认证成功，后端仍返回 `ACCOUNT_DISABLED` |
-
-这些固定密码和 Mock IdP 只能用于本地开发及自动化测试，不得部署到生产环境。
-
-### 3.5 初始化生产权限管理员
-
-生产环境必须接入真实外部 IdP 的 HTTPS issuer 和 JWKS 地址。主后端只把 JWT
-当作已签名的外部身份凭据；用户、角色、权限和数据范围均从数据库读取，JWT
-中自带的 `roles`、`permissions` 或 `org_scope` 不参与授权。首次部署在迁移完成后执行一次：
-
-```bash
-uv run python scripts/bootstrap_security.py \
-  --issuer "你的 JWT issuer" \
-  --subject "管理员 JWT 的 sub" \
-  --username admin \
-  --display-name "系统管理员" \
-  --organization-code ROOT \
-  --organization-name "总部"
-```
-
-脚本创建数据库用户、根组织和全局系统管理员角色。后续通过 `/api/v1/admin/access/*` 管理组织、用户、角色、授权期限、数据范围和撤销原因；所有授权变更都会进入审计日志。
-
-## 4. 切换模型和存储
-
-业务代码不需要修改，只改环境变量：
-
-| 能力 | 当前默认 | 可替换值 |
-|---|---|---|
-| 文字 | `TEXT_PROVIDER=qwen` | `fake`、`openai`、`custom_http` |
-| 语音 | `ASR_PROVIDER=local_http` | `fake`、`openai`、`custom_http` |
-| 视觉 | `VISION_PROVIDER=local_http` | `fake`、`custom_http` |
-| 存储 | `STORAGE_PROVIDER=local_filesystem` | `memory`、`s3` |
-
-例如将文字和语音切到 OpenAI API：
-
-```env
-TEXT_PROVIDER=openai
-ASR_PROVIDER=openai
-OPENAI_API_KEY=...
-OPENAI_TEXT_MODEL=...
-OPENAI_ASR_MODEL=...
-```
-
-这里使用的是 OpenAI API，不是 ChatGPT 网页订阅。
-
-## 5. 接入未来自训模型
-
-推荐把自训模型部署成独立 HTTP 推理服务：
-
-- 文字：OpenAI 兼容 `POST /v1/chat/completions`，支持 JSON Schema 结构化输出。
-- ASR：multipart `POST /v1/transcriptions`，返回 `full_text`、`duration_ms` 和 `segments`。
-- 视觉：multipart `POST /v1/vision/analyze`，返回 `{"findings": [...]}`。
-
-然后设置：
-
-```env
-TEXT_PROVIDER=custom_http
-CUSTOM_TEXT_BASE_URL=http://internal-text-server/v1
-CUSTOM_TEXT_MODEL=company-text-v1
-
-ASR_PROVIDER=custom_http
-ASR_BASE_URL=http://internal-asr-server
-ASR_MODEL=company-asr-v1
-
-VISION_PROVIDER=custom_http
-VISION_BASE_URL=http://internal-vision-server
-VISION_MODEL=company-vision-v1
-```
-
-业务模块只接收统一的 `MediaRef` 和结构化结果，不知道文件来自本地还是 S3，也不知道推理来自本机、OpenAI 或自训模型。
-
-## 6. 切换 AWS S3
-
-参考 `.env.aws.example`：
-
-```env
-STORAGE_PROVIDER=s3
-S3_ENDPOINT_URL=
-S3_PUBLIC_ENDPOINT_URL=
-S3_BUCKET=pipechina-production
-S3_REGION=us-east-1
-S3_ADDRESSING_STYLE=auto
-```
-
-在 ECS、EC2 或 EKS 上优先使用 IAM Role，保持 `S3_ACCESS_KEY` 和 `S3_SECRET_KEY` 为空。项目会使用 boto3 默认凭证链。桶本身应由 Terraform/CloudFormation 等基础设施代码创建；`ensure_bucket` 只用于本地 S3 兼容环境。
-
-本地需要演练 S3 适配器时，可把 `.env` 改成 SeaweedFS 配置，并执行：
-
-```bash
+1. 建立项目doit，选择uv工程，3.14版本
+
+2. 拷贝
+.gitignore
+.env                        # ⚠️仔细看里面要改你自己的用户名和密码       
+.python-version             # 这个文件是uv这个框架需要的，用于指定python版本
+shared-infra.compose.yml    # 这个文件按理说要保存好，放在项目外部
+README.md                   # uv要求必须带一个README.md
+
+pyproject.toml              # uv中的项目依赖
+uv.lock                     # 按理说uv.lock是靠上一个文件生成的 我们可以直接拷贝
+
+
+3. 拷贝文件夹
+dev                         # 这里只是在假装模拟外部的Java项目
+scripts/bootstrap_mock_idp_users.py   # 这个文件只是一个脚本，为了配合实验准备了3个用户
+
+
+4. 建立根目录app和app下的__init__.py，在__init__.py里面放
+__version__="1.3.0"  # 表示当前项目的版本，随意写
+
+5. 拷贝app/bootstrap文件夹下的config.py文件
+
+6. 拷贝ports文件夹
+如果项目目前不用音频和视频，可以删掉speech.py、vision.py两个文件
+然后修改__init__.py中被删掉文件的导入部分
+
+7. 拷贝infrastructure文件夹
+7.1 删掉了providers下的文件
+fake.py， http_asr.py，http_vision.py，openai_asr.py，openai_text.py
+然后修改__init__.py中被删掉文件的导入部分
+
+7.2 删掉了storage下的文件
+memory.py，s3.py
+然后修改__init__.py中被删掉文件的导入部分
+
+8. 拷贝shared文件夹，这里放的都是平台基础设置，比如权限，request_id检查等等
+8.1 删除shared/worker_runtime.py中没用的依赖，最终得到
+from __future__ import annotations
+
+# 为Celery任务创建独立数据库会话、Provider和最小权限执行身份。
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.bootstrap.config import Settings, get_settings
+from app.bootstrap.providers import create_provider_bundle
+from app.ports.storage import StorageProvider
+from app.ports.text import TextLLMProvider
+from app.shared.db import Database
+from app.shared.platform.models import AsyncJob
+from app.shared.platform.service import update_job
+from app.shared.security.authorization.permissions import Permissions
+from app.shared.security.authorization.schemas import CurrentUser
+
+
+class WorkerResources:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.database = Database(settings.database_url)
+        self.providers = create_provider_bundle(settings)
+
+    @property
+    def text(self) -> TextLLMProvider:
+        return self.providers.text
+
+    @property
+    def storage(self) -> StorageProvider:
+        return self.providers.storage
+
+    async def close(self) -> None:
+        await self.providers.close()
+        await self.database.dispose()
+
+
+@asynccontextmanager
+async def worker_resources(settings: Settings | None = None) -> AsyncIterator[WorkerResources]:
+    resources = WorkerResources(settings or get_settings())
+    try:
+        yield resources
+    finally:
+        await resources.close()
+
+
+def job_user(job: AsyncJob) -> CurrentUser:
+    permission_by_job = {
+        "audio_transcription": Permissions.HANDOVER_PROCESS,
+        "handover_summary": Permissions.HANDOVER_PROCESS,
+        "event_extraction": Permissions.EVENT_EXTRACT,
+        "event_classification": Permissions.EVENT_CLASSIFY,
+        "inspection_image_analysis": Permissions.INSPECTION_ANALYZE,
+        "report_generation": Permissions.REPORT_GENERATE,
+        "report_export": Permissions.REPORT_EXPORT,
+    }
+    permission = permission_by_job.get(job.job_type)
+    if permission is None:
+        raise ValueError(f"no worker permission mapping for job type {job.job_type}")
+    return CurrentUser(
+        user_id=job.requested_by,
+        subject=f"worker:{job.requested_by}",
+        username="celery-worker",
+        display_name="异步任务执行器",
+        organization_unit_id=job.organization_unit_id,
+        roles={"system_worker"},
+        permissions={permission},
+        organization_scope={job.organization_unit_id},
+    )
+
+
+async def mark_job_failed(session: AsyncSession, job: AsyncJob, exc: Exception) -> None:
+    """在Celery重投前保存经过脱敏的失败状态。"""
+    if job.status in {"succeeded", "failed", "cancelled"}:
+        return
+    await update_job(
+        session,
+        job,
+        status="failed",
+        progress=job.progress,
+        message="worker execution failed",
+        error_code=type(exc).__name__,
+        error_detail=str(exc)[:2000],
+    )
+    await session.commit()
+
+
+
+
+9. 拷贝bootstrap文件夹下面的其余文件（除了config.py之外的）
+9.1 删除app/bootstrap/celery_app.py中的下面几行
+"app.modules.handover.application.tasks",  # 交接班任务
+"app.modules.operation_event.application.tasks",  # 生产事件任务
+"app.modules.maintenance_order.application.tasks",  # 维检任务
+"app.modules.inspection.application.tasks",  # 巡检任务
+"app.modules.report.application.tasks",  # 报告任务
+
+
+"check-work-order-reminders": {
+    "task": "app.modules.maintenance_order.check_reminders",
+    "schedule": 60.0,  # 每分钟检查工单提醒
+},
+"generate-daily-operation-reports": {
+    "task": "app.modules.report.generate_daily_reports",
+    # UTC 16:10对应北京时间次日00:10。
+    "schedule": crontab(hour=16, minute=10),
+},
+
+9.2  删除app/bootstrap/model_registry.py中的下面几行
+from app.modules.handover.domain.models import *  # noqa: F403
+from app.modules.inspection.domain.models import *  # noqa: F403
+from app.modules.maintenance_order.domain.models import *  # noqa: F403
+from app.modules.operation_event.domain.models import *  # noqa: F403
+from app.modules.report.domain.models import *  # noqa: F403
+
+9.3 经过大量修改后的providers.py
+from __future__ import annotations
+
+import inspect
+from dataclasses import dataclass
+
+from pydantic import SecretStr
+
+from app.bootstrap.config import Settings
+from app.infrastructure.providers import (
+    QwenTextLLMProvider,
+)
+from app.infrastructure.storage import (
+    LocalFilesystemStorageProvider,
+)
+from app.ports.storage import StorageProvider
+from app.ports.text import TextLLMProvider
+
+
+def _secret(value: SecretStr | None) -> str:
+    """
+    安全地读取SecretStr中的真实字符串。如果配置值不存在则返回空字符串，避免调用方重复判断None。
+    """
+    return value.get_secret_value() if value is not None else ""
+
+
+@dataclass(slots=True)
+class ProviderBundle:
+    """集中保存应用运行期间使用的四类Provider。"""
+    text: TextLLMProvider
+    asr: None
+    vision: None
+    storage: StorageProvider
+
+    async def close(self) -> None:
+        """关闭ProviderBundle中的全部Provider资源"""
+        seen: set[int] = set()  # 保存已经关闭过的Provider对象ID。
+
+        for provider in (self.text, self.asr, self.vision, self.storage):
+            if id(provider) in seen:  # 判断同一个Provider对象是否已经处理过。
+                continue  # 已经处理过时跳过，避免重复关闭。
+
+            seen.add(id(provider))  # 记录当前Provider对象ID。
+
+            close = getattr(provider, "close", None)  # 获取Provider的close方法。
+
+            if close is None:  # 判断当前Provider是否没有提供close方法。
+                continue  # 没有需要释放的资源时直接跳过。
+
+            result = close()  # 调用Provider的close方法。
+
+            if inspect.isawaitable(result):  # 判断close方法返回的是否为可等待对象。
+                await result  # 异步等待资源关闭完成。
+
+
+def create_storage(settings: Settings) -> StorageProvider:
+    return LocalFilesystemStorageProvider(
+        root=settings.local_storage_root,  # 设置本地对象文件根目录。
+        public_base_url=settings.local_storage_public_base_url,  # 设置签名地址的公开基础URL。
+        # 读取签名密钥。
+        signing_secret=settings.local_storage_signing_secret.get_secret_value(),
+        upload_path=f"{settings.api_prefix}/storage/uploads",  # 设置签名上传接口路径。
+        download_path=f"{settings.api_prefix}/storage/downloads",  # 设置签名下载接口路径。
+    )
+
+
+def create_provider_bundle(settings: Settings) -> ProviderBundle:
+    """根据Settings创建完整的ProviderBundle。最后统一包装成ProviderBundle返回。"""
+    storage = create_storage(settings)  # 根据配置创建文件存储Provider。
+
+    text = QwenTextLLMProvider(
+        api_key=_secret(settings.dashscope_api_key),  # 读取百炼API Key。
+        base_url=settings.qwen_base_url,  # 设置千问接口基础地址。
+        model=settings.qwen_text_model,  # 设置千问模型名称。
+        timeout_seconds=settings.provider_timeout_seconds,  # 设置请求超时时间。
+        max_retries=settings.provider_max_retries,  # 设置最大重试次数。
+        trust_env=settings.provider_trust_env,  # 决定是否读取系统代理环境变量。
+    )
+
+    return ProviderBundle(  # 将四类Provider组合成统一资源包。
+        text=text,
+        asr=None,
+        vision=None,
+        storage=storage,
+    )
+
+
+10. 初始化alembic
+如果已经有，就可以拷贝根下的alembic.ini文件alembic文件夹
+如果是自动生成的，记得修改alembic.ini添加数据库连接，即
+sqlalchemy.url = postgresql+asyncpg://peter:123456@127.0.0.1:5432/pipechina
+
+然后修改alembic文件夹下的evn.py，添加
+from app.bootstrap.config import get_settings
+from app.shared.db import Base
+
+config = context.config
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+config.set_main_option("sqlalchemy.url", get_settings().database_url)
+target_metadata = Base.metadata
+
+
+
+11. 建立main.py
+from __future__ import annotations
+
+# FastAPI应用入口：装配数据库、Provider、中间件、异常处理器和业务路由。
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from uuid import uuid4
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
+
+from app import __version__
+from app.bootstrap.config import Settings, get_settings
+from app.bootstrap.providers import create_provider_bundle
+from app.shared.db import Database
+from app.shared.errors import install_error_handlers
+from app.shared.media.router import router as storage_transfer_router
+from app.shared.platform.idempotency import IdempotencyMiddleware
+from app.shared.platform.router import admin_router, jobs_router
+from app.shared.security.audit.context import request_id_context, reset_request_id
+from app.shared.security.authorization.repository import sync_builtin_roles
+from app.shared.security.authorization.router import router as access_control_router
+from app.shared.security.router import router as auth_router
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    configured = settings or get_settings()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        app.state.settings = configured
+        app.state.database = Database(
+            configured.database_url,
+            use_null_pool=configured.app_env == "test",
+        )
+        app.state.providers = create_provider_bundle(configured)
+        if configured.auto_create_schema:
+            await app.state.database.create_all()
+        if configured.auto_seed:
+            async with app.state.database.session_factory() as session:
+                await sync_builtin_roles(session)
+                await session.commit()
+        yield
+        await app.state.providers.close()
+        await app.state.database.dispose()
+
+    app = FastAPI(
+        title=configured.app_name,
+        version=__version__,
+        description="模块化单体后端；AI 结果默认是候选，正式业务动作需要确定性校验与人工授权。",
+        lifespan=lifespan,
+    )
+    install_error_handlers(app)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(configured.cors_allowed_origins),
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Request-ID", "Idempotency-Key"],
+        expose_headers=["X-Request-ID", "Idempotency-Key", "Idempotency-Replayed"],
+        max_age=600,
+    )
+    app.add_middleware(IdempotencyMiddleware)
+
+    @app.middleware("http")
+    async def request_context(request: Request, call_next):
+        request.state.request_id = request.headers.get("X-Request-ID") or str(uuid4())
+        token = request_id_context(request.state.request_id)
+        try:
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = request.state.request_id
+            return response
+        finally:
+            reset_request_id(token)
+
+    @app.get("/health/live", tags=["health"])
+    async def health_live() -> dict[str, str]:
+        return {"status": "ok", "version": __version__}
+
+    @app.get("/health/ready", tags=["health"])
+    async def health_ready(request: Request):
+        try:
+            async with request.app.state.database.session_factory() as session:
+                await session.execute(text("SELECT 1"))
+            return {"status": "ready"}
+        except Exception:
+            return JSONResponse(status_code=503, content={"status": "not_ready"})
+
+    for router in (
+        auth_router,
+        access_control_router,
+        jobs_router,
+        admin_router,
+        storage_transfer_router,
+    ):
+        app.include_router(router, prefix=configured.api_prefix)
+
+    return app
+
+
+app = create_app()
+
+
+12. 用shared-infra.compose.yml建立初始化容器4个
+在项目根目录下打开终端，避免找不到shared-infra.compose.yml
+docker compose -f shared-infra.compose.yml up -d postgres
+docker compose -f shared-infra.compose.yml up -d rabbitmq
 docker compose -f shared-infra.compose.yml up -d seaweedfs
-docker compose --profile s3-local up -d --build object-storage-init
-```
+docker compose -f shared-infra.compose.yml up -d redis
 
-## 7. 文件隐私边界
+13. 建立一个叫做pipechina的数据库
+下面的两个命令只要随便找一个终端都可以执行
 
-- 本地存储文件不会因为调用千问文字模型而自动上传到百炼。
-- 音频由本地 ASR 读取；图片由本地视觉服务读取。
-- 语音转写后的文字、事件原文和报告来源会在对应文字任务中发送给千问。
-- 如果切换远程 ASR，音频会发送给相应远程供应商。
-- 如果未来加入远程视觉适配器，图片才会发送给相应供应商。
+docker exec postgres sh -c 'psql -U "$POSTGRES_USER" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '\''pipechina'\''" | grep -q 1 || createdb -U "$POSTGRES_USER" pipechina'
 
-## 8. 验证
+⚠️下面有一个peter，改成你自己.env里面的用户名
+docker exec postgres psql -U peter -d postgres -c '\l pipechina'
 
-默认单元和 API 测试使用本机公共 PostgreSQL 中的独立数据库 `pipechina_test`，并在每个测试前重建其 `public` schema；不会读写长期运行的 `pipechina` 开发库。首次运行前按 `PROJECT_INITIALIZATION.md` 创建该数据库。CI 使用一次性 PostgreSQL `pipechina_ci`。
+此时就可以在pycharm的右侧连接数据库
 
-```bash
-uv lock --check
-uv run ruff format --check .
-uv run ruff check .
-uv run mypy app scripts
-uv run python -m compileall -q app alembic tests scripts inference
-uv run coverage run -m pytest -W error
-uv run coverage report --fail-under=65
-uv run pip-audit --local --skip-editable
-```
+14. 初始化用户和Java系统
+在项目的根目录下打开终端，输入
+uv run uvicorn dev.mock_idp.main:app --host 127.0.0.1 --port 9001 --reload
 
-默认测试使用 Fake Provider、PostgreSQL 测试库和内存存储，不调用收费 API，也不下载模型。真实百炼、本地模型和 AWS 联调均设计为显式的部署后冒烟测试。
+uv run python scripts/bootstrap_mock_idp_users.py
+此时可以看见数据库user_account表格中有3个用户
+
+
+15. 初始化项目结构，运行消息队列
+修改.env的
+LOCAL_STORAGE_ROOT=/tmp/pipechina/objects
+这里找你自己电脑上有权限的文件夹就行了。
+
+在项目的根目录下打开终端，输入
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+
+uv run celery -A app.bootstrap.celery_app:celery_app worker --without-mingle --without-gossip -l INFO -Q audio,ai_text,vision,report,maintenance
+
+uv run celery -A app.bootstrap.celery_app:celery_app beat -l INFO
+
+
+
+
